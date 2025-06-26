@@ -1,0 +1,871 @@
+---
+title: "Modelos_v9_APOE_CON_INTER"
+format: html
+editor: visual
+---
+
+#### Importamos librerías
+
+```{r}
+library(readr)
+library(lme4)       # Para modelos lineales mixtos
+library(lmerTest)   # Para p-valores en lmer
+library(cluster)    # Para análisis de clúster
+library(ggplot2)    # Para visualización
+library(factoextra)
+library(plotly)
+library(ggrepel)
+
+
+library(ggdendro)
+library(dbscan)
+library(ggdendro)
+library(dendextend)
+library(viridis)
+library(RColorBrewer)
+
+library(tidyr)
+
+library(caret)
+
+library(pheatmap)
+
+
+library(dplyr)
+```
+
+#### Lectura de datos
+
+```{r}
+df <- read_csv("df.csv", show_col_types = FALSE) #esto último se usa para que no te salgan advertencias  df
+```
+
+Seleccionamos las variables que tenemos interés
+
+```{r}
+columnas_df <- names(df) 
+partes_cerebro <- columnas_df[grepl("(SV|CV|TA|SA)$", columnas_df)]  # Elegimos las que nos interesan: "SV", "CV", "TA" o "SA" 
+```
+
+Contamos cuántas variables hay de hombre y mujer (género masculino y femenino)
+
+```{r}
+conteo_M <- sum(grepl("Male", df$PTGENDER))
+conteo_F <- sum(grepl("Female", df$PTGENDER))
+
+conteo_gender <- data.frame(
+  Tipo = c("Male", "Female"),
+  Conteo = c(conteo_M, conteo_F)
+)
+
+print(conteo_gender)
+```
+
+```{r}
+unique(df$DX_bl)
+```
+
+```{r}
+df$DX_bl <- factor(df$DX_bl, levels = c("CN", "SMC", "EMCI", "LMCI", "AD"), ordered = TRUE)
+df$PTGENDER <- factor(df$PTGENDER)
+```
+
+### MODELO
+
+```{r}
+# Crear un data frame vacío para almacenar los resultados
+resultados_coeficientes_DX_bl <- data.frame()
+
+# Iterar sobre las columnas filtradas
+for (col in partes_cerebro) {
+  # Obtener los resultados del modelo
+  
+  df$col_scale <- scale(df[,col])
+  
+  fit <- lmerTest::lmer(col_scale ~ DX_bl*Month_bl + PTGENDER + AGE + PTEDUCAT + (1|RID), data = df)
+  
+  # Summary
+  resumen <- summary(fit)
+  coeficientes <- as.data.frame(resumen$coefficients)
+  
+  # Extraer y transponer los coeficientes
+  fila_estimates <- t(coeficientes$Estimate)
+  colnames(fila_estimates) <- paste0("Coef_", rownames(coeficientes))
+  
+  # Combinar con el nombre de la parte del cerebro
+  fila <- data.frame(Parte_Cerebro = col, fila_estimates, check.names = FALSE)
+  
+  # Añadir al data frame acumulativo
+  resultados_coeficientes_DX_bl <- rbind(resultados_coeficientes_DX_bl, fila)
+}
+
+# Visualizar el resultado final
+print(resultados_coeficientes_DX_bl)
+```
+
+Varias comprobaciones
+
+```{r}
+conteo_SV <- sum(grepl("SV", resultados_coeficientes_DX_bl$Parte_Cerebro))
+conteo_CV <- sum(grepl("CV", resultados_coeficientes_DX_bl$Parte_Cerebro))
+conteo_TA <- sum(grepl("TA", resultados_coeficientes_DX_bl$Parte_Cerebro))
+conteo_SA <- sum(grepl("SA", resultados_coeficientes_DX_bl$Parte_Cerebro))
+
+# Mostrar los resultados
+conteo <- data.frame(
+  Tipo = c("SV", "CV", "TA", "SA"),
+  Conteo = c(conteo_SV, conteo_CV, conteo_TA, conteo_SA)
+)
+
+print(conteo)
+
+
+```
+
+Comprobamos el tipo de dato de cada columna
+
+```{r}
+str(resultados_coeficientes_DX_bl)
+```
+
+Seleccionamos todos los datos menos la parte del cerebro y el intercepto
+
+```{r}
+datos_numericos_DX_bl <- resultados_coeficientes_DX_bl %>%
+  select(-Parte_Cerebro)
+```
+
+Añadimos unas columnas más para calcular la pendiente
+
+```{r}
+resultados_coeficientes_DX_bl_total <- resultados_coeficientes_DX_bl
+# Sumar solo los coeficientes de DX_bl
+resultados_coeficientes_DX_bl_total$Suma_DX_4_Month <- resultados_coeficientes_DX_bl$`Coef_DX_bl^4` + resultados_coeficientes_DX_bl$`Coef_DX_bl^4:Month_bl`
+
+# Sumar DX_bl y Month_bl
+resultados_coeficientes_DX_bl_total$Suma_DX_C_Month <- resultados_coeficientes_DX_bl$`Coef_DX_bl.C:Month_bl` + resultados_coeficientes_DX_bl$Coef_DX_bl.C 
+
+# Sumar DX_bl y Month_bl
+resultados_coeficientes_DX_bl_total$Suma_DX_bl_Q_Month <- resultados_coeficientes_DX_bl$Coef_DX_bl.Q + resultados_coeficientes_DX_bl$`Coef_DX_bl.Q:Month_bl`
+
+
+# Sumar DX_bl y Month_bl
+resultados_coeficientes_DX_bl_total$Suma_DX_bl_L_Month <- resultados_coeficientes_DX_bl$Coef_DX_bl.L + resultados_coeficientes_DX_bl$`Coef_DX_bl.L:Month_bl`
+```
+
+Quitamos la parte del cerebro
+
+```{r}
+datos_numericos_DX_bl_total <- resultados_coeficientes_DX_bl_total %>%
+  select(-Parte_Cerebro)
+```
+
+#### Calculamos el número de clústeres que necesitamos
+
+```{r}
+###Automatiza el cálculo de WCSS (Within-Cluster Sum of Squares) para diferentes valores de k.
+
+# Calcular el codo
+fviz_nbclust(datos_numericos_DX_bl, kmeans, method = "wss") + 
+  labs(title = "Elbow Plot para determinar el número óptimo de clústeres")
+```
+
+Otra forma de calcular el número de clústeres
+
+```{r}
+set.seed(123)  # Asegurar la reproducibilidad
+
+
+wcss <- numeric()
+
+# Probar desde 1 hasta 15 clústeres
+for (k in 1:15) {
+  kmeans_result_DX_bl <- kmeans(datos_numericos_DX_bl, centers = k, nstart = 25)
+  wcss[k] <- kmeans_result_DX_bl$tot.withinss
+}
+
+# Crear el elbow plot
+plot(1:15, wcss[1:15], type = "b", pch = 19, frame = FALSE,
+     xlab = "Número de Clústeres (k)", ylab = "WCSS",
+     main = "Elbow Plot")
+```
+
+### Clusterizamos
+
+```{r}
+# Número óptimo de clústeres
+k <- 3
+
+# Realizar la clusterización
+kmeans_result_DX_bl <- kmeans(datos_numericos_DX_bl, centers = k, nstart = 25)
+```
+
+#### ANOVA con los clusters
+
+```{r}
+datos_numericos_DX_bl_total$Cluster <- as.factor(kmeans_result_DX_bl$cluster)
+
+# Crear un data frame vacío para guardar los resultados del ANOVA
+resultados_anova_cluster <- data.frame()
+
+# Iterar sobre cada columna numérica (excepto "Cluster")
+for (coef in setdiff(colnames(datos_numericos_DX_bl_total), "Cluster")) {
+  # Realizar el ANOVA para cada columna con el Cluster como factor
+  modelo_anova <- aov(datos_numericos_DX_bl_total[[coef]] ~ datos_numericos_DX_bl_total$Cluster)
+  
+  # Obtener la tabla de ANOVA
+  resumen_anova <- summary(modelo_anova)[[1]]
+  
+  # Convertir el resultado a un data frame
+  anova_df <- as.data.frame(resumen_anova)
+  
+  # Filtramos y calculamos si el p-valor es significativo
+  anova_df$Coeficiente <- coef
+  
+  # Guardamos el resultado en el data frame acumulativo
+  resultados_anova_cluster <- rbind(resultados_anova_cluster, anova_df)
+}
+
+# Filtrar resultados significativos (p < 0.05)
+resultados_significativos_cluster <- subset(resultados_anova_cluster, `Pr(>F)` < 0.001)
+
+rownames(resultados_significativos_cluster) <- resultados_significativos_cluster$Coeficiente
+
+# Mostrar los resultados significativos
+print(resultados_significativos_cluster)
+
+```
+
+##### BoxPlot
+
+```{r}
+
+datos_boxPlot_DX_bl <- datos_numericos_DX_bl_total %>%
+  gather(key = "Coeficiente", value = "Valor", -Cluster)  
+
+ggplot(datos_boxPlot_DX_bl, aes(x = as.factor(Cluster), y = Valor)) +
+  geom_boxplot() +
+  facet_wrap(~ Coeficiente, scales = "free") +  # Crear un gráfico por cada coeficiente
+  labs(title = "Distribución de coeficientes según Cluster",
+       x = "Cluster",
+       y = "Valor del Coeficiente") +
+  theme_minimal()
+
+
+```
+
+```{r}
+for (coef in resultados_significativos_cluster$Coeficiente) {
+  
+  # Crear el boxplot para cada coeficiente significativo
+  p <- ggplot(datos_numericos_DX_bl_total, aes(x = Cluster, y = datos_numericos_DX_bl_total[[coef]], fill = Cluster)) +
+    geom_boxplot() +
+    labs(title = paste("Boxplot de", coef, "por Cluster"), 
+         x = "Cluster", 
+         y = coef) +
+    theme_minimal() +
+    theme(legend.position = "none") 
+  
+  # Mostrar el gráfico
+  print(p)
+}
+ 
+```
+
+Boxplot de cada cluster para el Mes junto con el DX_bl (las pendientes generadas)
+
+```{r}
+res_coef_DX_cluster_total <- resultados_coeficientes_DX_bl_total
+res_coef_DX_cluster_total$Cluster <- as.factor(kmeans_result_DX_bl$cluster)
+
+# Transformar los datos para que cada cluster tenga tres cajas
+datos_boxPlot_DX <- res_coef_DX_cluster_total %>%
+  select(Cluster, Coef_Month_bl, Suma_DX_bl_L_Month, Suma_DX_bl_Q_Month, Suma_DX_C_Month, Suma_DX_4_Month) %>%
+  gather(key = "Tipo_Pendiente", value = "Valor", -Cluster)
+
+for (cl in unique(datos_boxPlot_DX$Cluster)) {
+  datos_cluster <- datos_boxPlot_DX %>% filter(Cluster == cl)
+  
+  p <- ggplot(datos_cluster, aes(x = Tipo_Pendiente, y = Valor, fill = Tipo_Pendiente)) +
+    geom_boxplot() +
+    labs(title = paste("Cluster", cl),
+         x = "Pendientes",
+         y = "Valor") +
+    theme_minimal()
+  
+  print(p)  # Muestra cada gráfico por separado
+}
+```
+
+BoxPlot de las pendientes según los clústeres
+
+```{r}
+ggplot(datos_boxPlot_DX, aes(x = interaction(Tipo_Pendiente, Cluster), y = Valor, fill = Cluster)) +
+  geom_boxplot() +
+  labs(title = "Distribución de coeficientes según Cluster",
+       x = "Pendiente y Cluster",
+       y = "Valor",
+       fill = "Cluster") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+BoxPlot de cada pendiente
+
+```{r}
+
+datos_boxPlot_DX <- res_coef_DX_cluster_total %>%
+  select(Cluster, Coef_Month_bl, Suma_DX_4_Month, Suma_DX_C_Month, Suma_DX_bl_Q_Month, Suma_DX_bl_L_Month) %>%
+  gather(key = "Pendiente", value = "Valor", -Cluster)
+
+
+
+ggplot(datos_boxPlot_DX, aes(x = Pendiente, y = Valor, fill = as.factor(Cluster))) +
+  geom_boxplot(position = position_dodge(0.8)) +  # Separar los clusters dentro de cada pendiente
+  labs(title = "Distribución de coeficientes según Pendiente",
+       x = "Pendiente",
+       y = "Valor del Coeficiente",
+       fill = "Cluster") +
+  theme_minimal()
+```
+
+### Observamos Resultados
+
+APLICA PCA directamente la función fviz_cluster
+
+```{r}
+p_DX_bl <- fviz_cluster(kmeans_result_DX_bl, data = datos_numericos_DX_bl, geom = "point", ellipse.type = "norm")
+
+p_DX_bl
+```
+
+```{r}
+# Extraer los datos generados por fviz_cluster()
+plot_data_DX_bl <- ggplot_build(p_DX_bl)$data[[1]]
+
+```
+
+De forma interactiva
+
+```{r}
+# Crear el gráfico interactivo manteniendo los colores de los clusters
+p_interactive_DX_bl <- fviz_cluster(kmeans_result_DX_bl, data = datos_numericos_DX_bl, geom = "point", ellipse.type = "norm") +
+  geom_point(aes(x = plot_data_DX_bl$x, 
+                 y = plot_data_DX_bl$y, 
+                 text = resultados_coeficientes_DX_bl$Parte_Cerebro,
+                 color = plot_data_DX_bl$colour),  # Agregar el color según el cluster
+             size = 3, alpha = 0.7) +
+  scale_color_identity()  # Esto mantiene los colores originales de los clusters
+
+# Convertir a gráfico interactivo
+interactive_plot_DX_bl <- ggplotly(p_interactive_DX_bl, tooltip = "text")
+
+# Mostrar el gráfico interactivo
+interactive_plot_DX_bl
+```
+
+```{r}
+plot_data_DX_bl$text <- resultados_coeficientes_DX_bl$Parte_Cerebro  # Agregar las partes del cerebro
+
+# Crear gráfico interactivo con plot_ly
+interactive_plot_DX_bl.2 <- plot_ly(data = plot_data_DX_bl, 
+                            x = ~x, 
+                            y = ~y, 
+                            type = 'scatter', 
+                            mode = 'markers+text', 
+                            text = ~text, 
+                            textposition = 'top',  # Ubicar el texto arriba de los puntos
+                            marker = list(size = 10, color = ~colour, opacity = 0.7),
+                            hoverinfo = 'text') %>%
+  layout(title = "Cluster con partes del cerebro", 
+         showlegend = FALSE)
+
+# Mostrar el gráfico interactivo
+interactive_plot_DX_bl.2
+
+```
+
+### PCA
+
+```{r}
+# Aplicar PCA asegurando datos escalados
+df_PCA <- datos_numericos_DX_bl
+pca_result_DX <- prcomp(df_PCA)
+
+head(pca_result_DX$rotation)[,1:5]
+xx <- pca_result_DX$x
+xx<- as.data.frame(xx)
+df_PCA$PC1 <- xx$PC1
+df_PCA$PC2 <- xx$PC2
+
+cor(df_PCA)
+df_cluster_PCA_DX_bl <- as.data.frame(pca_result_DX$x[, 1:2])  # Tomamos las dos primeras componentes principales
+
+# Asignar nombres de partes del cerebro
+df_cluster_PCA_DX_bl$Parte_Cerebro <- resultados_coeficientes_DX_bl$Parte_Cerebro
+
+# Aplicar K-Means para obtener clusters (con k = 3)
+set.seed(123)  # Para reproducibilidad
+k <- 3
+kmeans_result_PCA_DX_bl <- kmeans(datos_numericos_DX_bl, centers = k)
+df_cluster_PCA_DX_bl$Cluster <- as.factor(kmeans_result_PCA_DX_bl$cluster)  # Convertir clusters a factor
+
+# Definir colores bien diferenciados
+colores_clusters_PCA_DX_bl <- brewer.pal(k, "Set1")
+```
+
+Hacemos una tabla con los resultados
+
+```{r}
+df_cluster_1_PCA <- df_cluster_PCA_DX_bl %>% filter(Cluster == 1) %>% filter(!is.na(Parte_Cerebro))
+df_cluster_2_PCA <- df_cluster_PCA_DX_bl %>% filter(Cluster == 2) %>% filter(!is.na(Parte_Cerebro))
+df_cluster_3_PCA <- df_cluster_PCA_DX_bl %>% filter(Cluster == 3) %>% filter(!is.na(Parte_Cerebro))
+
+# Mostrar las tablas para cada cluster
+print("Cluster 1:")
+print(df_cluster_1_PCA)
+
+print("Cluster 2:")
+print(df_cluster_2_PCA)
+
+print("Cluster 3:")
+print(df_cluster_3_PCA)
+```
+
+```{r}
+
+# Crear el gráfico con etiquetas bien posicionadas
+p_PCA_DX_bl.2 <- ggplot(df_cluster_PCA_DX_bl, aes(x = PC1, y = PC2, color = Cluster, text = Parte_Cerebro)) +
+  geom_point(size = 3, alpha = 0.7) +  
+  geom_text_repel(aes(label = Parte_Cerebro), size = 3, box.padding = 0.4, point.padding = 0.2) +  
+  scale_color_manual(values = colores_clusters_PCA_DX_bl) +  
+  labs(title = "Clusterización de Partes del Cerebro (PCA)",
+       x = "Componente Principal 1", 
+       y = "Componente Principal 2") +
+  theme_minimal()
+
+# Convertir en gráfico interactivo
+interactive_plot_PCA_DX_bl.2 <- ggplotly(p_PCA_DX_bl.2, tooltip = "text")
+
+# Mostrar el gráfico interactivo
+interactive_plot_PCA_DX_bl.2
+
+
+```
+
+```{r}
+# Crear gráfico interactivo con plot_ly
+interactive_plot_PCA_DX_bl.3 <- plot_ly(
+  df_cluster_PCA_DX_bl, 
+  x = ~PC1, 
+  y = ~PC2, 
+  text = ~Parte_Cerebro,  # Tooltip al pasar el cursor
+  color = ~Cluster, 
+  colors = colores_clusters_PCA_DX_bl, 
+  type = "scatter", 
+  mode = "markers+text",  # Muestra puntos y etiquetas
+  textposition = "top center"  # Mueve etiquetas arriba del punto
+) %>%
+  layout(
+    title = "Clusterización de Partes del Cerebro (PCA)",
+    xaxis = list(title = "Componente Principal 1"),
+    yaxis = list(title = "Componente Principal 2")
+  )
+
+# Mostrar el gráfico interactivo
+interactive_plot_PCA_DX_bl.3
+
+```
+
+Cuánta varianza explican las componentes principales (PCA)
+
+```{r}
+# Mostrar resumen del PCA
+summary(pca_result_DX)
+
+
+
+# Extraer proporción de varianza explicada
+var_exp <- summary(pca_result_DX)$importance
+
+# Mostrar el porcentaje explicado por PC1 y PC2
+pc1_var <- round(var_exp[2, 1] * 100, 2)
+pc2_var <- round(var_exp[2, 2] * 100, 2)
+
+cat("PC1 explica:", pc1_var, "%\n")
+cat("PC2 explica:", pc2_var, "%\n")
+cat("Total:", pc1_var + pc2_var, "% de la varianza total\n")
+```
+
+```{r}
+fviz_eig(pca_result_DX, addlabels = TRUE)
+```
+
+#Df structure
+
+```{r}
+df_structure <- read_csv("structures_mri_adni.csv", show_col_types = FALSE)
+```
+
+Este df contiene un id para luego poder hacer una correcta relación con las partes del cerebro a la hora de dibujarlo.
+
+```{r}
+df_structure <- df_structure %>% filter(!is.na(id) & id != "")
+
+
+df_union_DX_bl <- merge(df_structure[, c("feature", "0", "id")], df_cluster_PCA_DX_bl[, c("Parte_Cerebro", "Cluster")], by.x = "feature", by.y = "Parte_Cerebro")
+```
+
+```{r}
+write.csv(df_union_DX_bl, "df_union_DX_bl.csv", row.names = FALSE)
+```
+
+##### *Biplot a partir de la PCA*
+
+```{r}
+# Crear el biplot con factoextra
+biplot_pca_DX_bl <- fviz_pca_biplot(pca_result_DX, 
+                              geom = "point", 
+                              col.ind = df_cluster_PCA_DX_bl$Cluster,  # Color por cluster
+                              palette = "Set1", 
+                              repel = TRUE) + 
+  theme_minimal() +
+  ggtitle("Biplot de PCA con Clusters") +
+  
+  # Agregar etiquetas con el nombre de la parte del cerebro
+  geom_text(aes(x = PC1, y = PC2, label = Parte_Cerebro), 
+            data = df_cluster_PCA_DX_bl, 
+            hjust = 0.5, vjust = -1, size = 3, color = "black")
+
+# Mostrar el gráfico
+print(biplot_pca_DX_bl)
+
+biplot_interactivo_DX_bl <- ggplotly(biplot_pca_DX_bl, tooltip = c("text"))
+
+# Mostrar el gráfico interactivo
+biplot_interactivo_DX_bl
+
+
+
+
+```
+
+```{r}
+variables_pca_DX_bl <- as.data.frame(pca_result_DX$rotation[, 1:2])  # PC1 y PC2
+variables_pca_DX_bl$Variable <- rownames(variables_pca_DX_bl)  # Nombre de cada variable
+
+# Crear el biplot con ggplot2
+biplot_pca_DX_bl.2 <- ggplot() +
+  # Representar las observaciones (puntos)
+  geom_point(data = df_cluster_PCA_DX_bl, aes(x = PC1, y = PC2, color = Cluster, text = Parte_Cerebro), size = 3) +
+  
+  # Añadir flechas de las variables (vectores)
+  geom_segment(data = variables_pca_DX_bl, aes(x = 0, y = 0, xend = PC1, yend = PC2), 
+               arrow = arrow(length = unit(0.2, "cm")), color = "black") +
+  
+  # Etiquetas de las variables
+  geom_text(data = variables_pca_DX_bl, aes(x = PC1, y = PC2, label = Variable), 
+            hjust = 1.2, vjust = 1.2, color = "black") +
+  
+  labs(title = "Biplot de PCA con Ejes de Variables", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+# Convertir el gráfico en interactivo usando plotly
+# Ahora, los tooltips mostrarán el nombre de la parte del cerebro
+biplot_interactivo_DX_bl.2 <- ggplotly(biplot_pca_DX_bl.2, tooltip = c("text"))
+
+# Mostrar el gráfico interactivo
+biplot_interactivo_DX_bl.2
+
+```
+
+Márgenes ampliados
+
+```{r}
+variables_pca_DX_bl <- as.data.frame(pca_result_DX$rotation[, 1:2])  # PC1 y PC2
+variables_pca_DX_bl$Variable <- rownames(variables_pca_DX_bl)  # Nombre de cada variable
+
+# Crear el biplot con ggplot2
+biplot_pca_DX_bl.2 <- ggplot() +
+  # Representar las observaciones (puntos)
+  geom_point(data = df_cluster_PCA_DX_bl, aes(x = PC1, y = PC2, color = Cluster, text = Parte_Cerebro), size = 5) +
+
+  # Añadir flechas de las variables (vectores)
+  geom_segment(data = variables_pca_DX_bl, aes(x = 0, y = 0, xend = PC1, yend = PC2), 
+               arrow = arrow(length = unit(0.4, "cm")), color = "black") +
+
+  # Etiquetas de las variables mucho más grandes
+  geom_text(data = variables_pca_DX_bl, aes(x = PC1, y = PC2, label = Variable), 
+            hjust = 1.2, vjust = 1.2, color = "black", size = 7, fontface = "bold") +
+
+  labs(title = "Biplot de PCA con Ejes de Variables", x = "PC1", y = "PC2") +
+
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 20, face = "bold"),
+    legend.text = element_text(size = 18),
+    legend.key.size = unit(1.5, "cm"),
+    plot.margin = margin(t = 40, r = 40, b = 40, l = 40, unit = "pt"),
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16)
+  )
+
+# Convertir el gráfico en interactivo usando plotly
+biplot_interactivo_DX_bl.2 <- ggplotly(biplot_pca_DX_bl.2, tooltip = c("text"))
+
+# Mostrar el gráfico interactivo
+biplot_interactivo_DX_bl.2
+
+```
+
+PCA3
+
+```{r}
+df_cluster_PCA_DX_3 <- as.data.frame(pca_result_DX$x[, 3:4])
+df_cluster_PCA_DX_3$Cluster <- as.factor(kmeans_result_PCA_DX_bl$cluster)
+df_cluster_PCA_DX_3$Parte_Cerebro <- resultados_coeficientes_DX_bl$Parte_Cerebro
+
+variables_pca_DX <- as.data.frame(pca_result_DX$rotation[, 3:4])  # PC1 y PC2
+variables_pca_DX$Variable <- rownames(variables_pca_DX)  # Nombre de cada variable
+
+# Crear el biplot con ggplot2
+biplot_pca_DX.3 <- ggplot() +
+  # Representar las observaciones (puntos)
+  geom_point(data = df_cluster_PCA_DX_3, aes(x = PC3, y = PC4, color = Cluster, text = Parte_Cerebro), size = 3) +
+  
+  # Añadir flechas de las variables (vectores)
+  geom_segment(data = variables_pca_DX, aes(x = 0, y = 0, xend = PC3, yend = PC4), 
+               arrow = arrow(length = unit(0.2, "cm")), color = "black") +
+  
+  # Etiquetas de las variables
+  geom_text(data = variables_pca_DX, aes(x = PC3, y = PC4, label = Variable), 
+            hjust = 1.2, vjust = 1.2, color = "black") +
+  
+  labs(title = "Biplot de PCA con Ejes de Variables", x = "PC3", y = "PC4") +
+  theme_minimal()
+
+# Convertir el gráfico en interactivo usando plotly
+# Ahora, los tooltips mostrarán el nombre de la parte del cerebro
+biplot_interactivo_DX.3 <- ggplotly(biplot_pca_DX.3, tooltip = c("text"))
+
+# Mostrar el gráfico interactivo
+biplot_interactivo_DX.3
+```
+
+### Dendograma
+
+```{r}
+# Calcular la matriz de distancia
+dist_matrix_DX_bl <- dist(datos_numericos_DX_bl, method = "euclidean")
+
+# Aplicar clustering jerárquico
+hc_DX_bl <- hclust(dist_matrix_DX_bl, method = "ward.D2")
+```
+
+#### Interactivo
+
+```{r}
+dend_data_DX_bl <- dendro_data(as.dendrogram(hc_DX_bl))
+
+# Reemplazar etiquetas con nombres de la columna 'Partes_cerebro'
+dend_data_DX_bl$labels$label <- resultados_coeficientes_DX_bl$Parte_Cerebro
+dend_data_DX_bl$labels$Cluster <- as.factor(cutree(hc_DX_bl, k = 3))
+```
+
+Interactivo con clusters
+
+```{r}
+# Definir número de clusters
+k <- 3
+clusters_dend_DX_bl <- cutree(hc_DX_bl, k = k)
+
+# Generar colores bien diferenciados
+colores_clusters_dend_DX_bl <- brewer.pal(k, "Set1")  # Set1 tiene colores fuertes y distinguibles
+```
+
+```{r}
+# Asignar colores correctos a las ramas
+segment_colors_DX_bl <- colores_clusters_dend_DX_bl[clusters_dend_DX_bl[dend_data_DX_bl$labels$label]]
+
+# Crear el gráfico asegurando colores correctos
+p_dend_DX_bl <- ggplot() +
+  geom_segment(data = dend_data_DX_bl$segments, 
+               aes(x = x, y = y, xend = xend, yend = yend), 
+               color = "grey50") +  # Color neutral para las líneas
+  geom_text(data = dend_data_DX_bl$labels, 
+            aes(x = x, y = y, label = label, color = Cluster), 
+            hjust = 1, size = 3) +
+  labs(title = "Dendrograma Interactivo de Partes del Cerebro") +
+  theme_minimal() +
+  scale_color_manual(values = colores_clusters_dend_DX_bl)  
+
+# Convertir a gráfico interactivo con Plotly
+interactive_dendrogram_DX_bl.1 <- ggplotly(p_dend_DX_bl)
+
+# Mostrar el dendrograma interactivo
+interactive_dendrogram_DX_bl.1
+
+```
+
+```{r}
+dist_matrix_DX <- dist(datos_numericos_DX_bl, method = "euclidean")
+hc_DX <- hclust(dist_matrix_DX, method = "ward.D2")
+
+# Convertir el resultado a un dendrograma y extraer datos
+dend_DX <- as.dendrogram(hc_DX)
+dend_data_DX <- dendro_data(dend_DX)
+
+# Obtener los clusters asegurando el orden correcto del dendrograma
+clusters_dend_DX <- cutree(hc_DX, k = k)
+
+# Ordenar las etiquetas de acuerdo con el dendrograma
+ordered_labels <- resultados_coeficientes_DX_bl$Parte_Cerebro[hc_DX$order]
+dend_data_DX$labels$label <- ordered_labels
+dend_data_DX$labels$Cluster <- as.factor(clusters_dend_DX[hc_DX$order])
+
+# Generar colores bien diferenciados
+colores_clusters_dend_DX <- brewer.pal(k, "Set1")
+
+# Asignar colores correctamente según el cluster
+segment_colors_DX <- colores_clusters_dend_DX[dend_data_DX$labels$Cluster]
+
+# Crear el gráfico asegurando que los colores estén bien asignados
+p_dend_DX <- ggplot() +
+  geom_segment(data = dend_data_DX$segments, 
+               aes(x = x, y = y, xend = xend, yend = yend), 
+               color = "grey50") +  # Color neutral para las líneas
+  geom_text(data = dend_data_DX$labels, 
+            aes(x = x, y = y, label = label, color = Cluster), 
+            hjust = 1, size = 3) +
+  labs(title = "Dendrograma Interactivo de Partes del Cerebro") +
+  theme_minimal() +
+  scale_color_manual(values = colores_clusters_dend_DX)  
+
+# Convertir a gráfico interactivo con Plotly
+interactive_dendrogram_DX.1 <- ggplotly(p_dend_DX)
+
+# Mostrar el dendrograma interactivo
+interactive_dendrogram_DX.1
+
+```
+
+**Dendograma jerárquico**
+
+```{r}
+# Normalizar los datos
+set.seed(123)
+kmeans_result <- kmeans(datos_numericos_DX_bl, centers = 3, nstart = 25)
+clusters <- kmeans_result$cluster
+
+# Calcular la distancia y el clustering jerárquico
+dist_matrix <- dist(datos_numericos_DX_bl, method = "euclidean")
+clustering <- hclust(dist_matrix, method = "ward.D2")
+```
+
+```{r}
+# Obtener clusters desde hclust
+hclust_clusters <- cutree(clustering, k = 3)
+
+# Convertir clustering en dendrograma y aplicar colores
+dend <- as.dendrogram(clustering)
+dend <- color_branches(dend, k = 3, col = rainbow(3))
+labels_colors(dend) <- rainbow(3)[hclust_clusters[clustering$order]]
+
+# Convertir a formato ggplot2
+dend_data <- ggdendro::dendro_data(clustering, type = "rectangle")
+dend_data$labels$tooltip <- resultados_coeficientes_DX_bl$Parte_Cerebro[clustering$order]
+dend_data$labels$label <- resultados_coeficientes_DX_bl$Parte_Cerebro[clustering$order]  # Mostrar nombres en lugar de números
+dend_data$labels$cluster <- factor(hclust_clusters[clustering$order])
+
+# Crear el gráfico con ggplot2
+dend_plot <- ggplot() +
+  geom_segment(data = dend_data$segments, aes(x = x, y = y, xend = xend, yend = yend), color = "gray50") +
+  geom_text(data = dend_data$labels, aes(x = x, y = y, label = label, text = tooltip, color = cluster), hjust = 1) +
+  scale_color_manual(values = rainbow(3)) +
+  theme_minimal() +
+  labs(color = "Cluster")
+
+# Convertir a gráfico interactivo
+dend_plotly <- ggplotly(dend_plot, tooltip = "text")
+
+# Mostrar dendrograma interactivo
+dend_plotly
+
+# Comparar clusters de kmeans y hclust
+table(clusters, hclust_clusters)
+
+```
+
+Comparación de clústeres realizados con PCA y Dendograma
+
+```{r}
+# Crear un data frame con las partes del cerebro y los clusters asignados
+df_clusters_dendograma <- data.frame(
+  Parte_Cerebro = resultados_coeficientes_DX_bl$Parte_Cerebro,
+  Cluster = as.factor(hclust_clusters)
+)
+
+```
+
+```{r}
+# Filtrar por cada cluster
+cluster_1_dendograma <- df_clusters_dendograma[df_clusters_dendograma$Cluster == 1, ]
+cluster_2_dendograma <- df_clusters_dendograma[df_clusters_dendograma$Cluster == 2, ]
+cluster_3_dendograma <- df_clusters_dendograma[df_clusters_dendograma$Cluster == 3, ]
+
+# Mostrar los DataFrames
+print(cluster_1_dendograma)
+print(cluster_1_dendograma)
+print(cluster_1_dendograma)
+
+```
+
+```{r}
+# Crear un data frame con los clusters de k-means y el dendrograma
+df_comparacion <- data.frame(
+  Parte_Cerebro = resultados_coeficientes_DX_bl$Parte_Cerebro,  # Asegúrate de que esta variable contiene los nombres correctos
+  Cluster_Dendrograma = as.factor(hclust_clusters),
+  Cluster_KMeans = as.factor(clusters)
+)
+
+
+# Coincidencias (mismo cluster en ambos métodos)
+coincidencias_dend_kmeans <- df_comparacion %>%
+  filter(Cluster_Dendrograma == Cluster_KMeans)
+
+# Diferencias (cuando el cluster es distinto en cada método)
+diferencias_dend_kmeans <- df_comparacion %>%
+  filter(Cluster_Dendrograma != Cluster_KMeans)
+
+# Mostrar resultados
+print("Coincidencias entre K-Means y Dendrograma:")
+print(coincidencias_dend_kmeans)
+
+print("Diferencias entre K-Means y Dendrograma:")
+print(diferencias_dend_kmeans)
+
+```
+
+### Heatmap con clusterización
+
+```{r}
+# Graficar heatmap con clustering
+datos <- datos_numericos_DX_bl
+pheatmap(datos, labels_row = resultados_coeficientes_DX_bl$Parte_Cerebro, clustering_distance_rows = "euclidean")
+
+
+```
+
+#### Heatmap con reducción de datos
+
+```{r}
+# Seleccionar solo las 3 variables con mayor varianza
+top_vars_DX_bl <- nearZeroVar(datos_numericos_DX_bl, saveMetrics = TRUE)
+top_vars_DX_bl <- rownames(top_vars_DX_bl[top_vars_DX_bl$nzv == FALSE, ]) # Variables con más variabilidad
+
+df_reduced_DX_bl <- datos_numericos_DX_bl[, top_vars_DX_bl[1:3]]  # Tomamos 3 de las más importantes
+
+pheatmap(df_reduced_DX_bl, labels_row = resultados_coeficientes_DX_bl$Parte_Cerebro, clustering_distance_rows = "euclidean")
+
+```
